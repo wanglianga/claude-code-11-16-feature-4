@@ -191,15 +191,21 @@ def split_order(
     device_readings: dict[int, list[models.MeterReading]],
     meter_by_device: dict[str, models.Meter],
     tariff_ids: set[int] | None = None,
+    price_resolver=None,
 ) -> list[OrderPiece]:
+    """price_resolver(ts_utc) -> (segment_name, price)：回补可用修正后电价计价；
+    缺省沿用冻结电价版本查询。"""
+    def _price(ts):
+        if price_resolver is not None:
+            return price_resolver(ts)
+        return price_at_utc(db, site.id, site.timezone, ts, tariff_ids)
+
     pieces_time = merge_boundaries(order.start_ts, order.end_ts, boundaries)
     total, basis, note = determine_order_energy(order)
     result: list[OrderPiece] = []
     if total is None:
         for t1, t2 in pieces_time:
-            seg_name, price = price_at_utc(
-                db, site.id, site.timezone, t1 + (t2 - t1) / 2, tariff_ids
-            )
+            seg_name, price = _price(t1 + (t2 - t1) / 2)
             result.append(OrderPiece(t1, t2, None, None, seg_name, price,
                                      models.BASIS_PENDING, note))
         return result
@@ -236,9 +242,7 @@ def split_order(
         energies[-1] = quantize(total - sum(energies[:-1], ZERO), Q4)
 
     for (t1, t2), energy in zip(pieces_time, energies):
-        seg_name, price = price_at_utc(
-            db, site.id, site.timezone, t1 + (t2 - t1) / 2, tariff_ids
-        )
+        seg_name, price = _price(t1 + (t2 - t1) / 2)
         amount = money(energy * price, settings.money_scale)
         result.append(
             OrderPiece(t1, t2, energy, amount, seg_name, price, piece_basis, split_note)

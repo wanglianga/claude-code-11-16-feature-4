@@ -6,6 +6,7 @@ from ..database import get_db
 from ..deps import ensure_site_access, require_roles
 from .. import models, schemas
 from ..services.billing import add_adjustment, check_new_revisions, confirm_bill
+from ..services import backfill as bf
 
 router = APIRouter(prefix="/api/bills", tags=["bills"])
 
@@ -66,10 +67,33 @@ def precheck(bill_id: int, db: Session = Depends(get_db),
 def confirm(bill_id: int, db: Session = Depends(get_db),
             user: models.User = Depends(require_roles(models.ROLE_FINANCE))):
     bill = _load_bill(db, bill_id, user)
+    # confirm_bill 内部会自动把同站点已确认回补项关联到本后续结算账单，
+    # 关联留痕保存在 BackfillBillLink.note，旧账本身金额不变。
     confirm_bill(db, bill, user)
     db.commit()
     db.refresh(bill)
     return bill
+
+
+@router.get("/{bill_id}/payable", response_model=schemas.BackfillPayableOut)
+def payable(bill_id: int, db: Session = Depends(get_db),
+            user: models.User = Depends(require_roles(
+                models.ROLE_FINANCE, models.ROLE_OPERATOR, models.ROLE_PROPERTY))):
+    """当前应付：旧账金额 + 人工差额更正 + 已确认回补调整项（旧账不覆盖）。"""
+    bill = _load_bill(db, bill_id, user)
+    return bf.bill_payable_view(db, bill)
+
+
+@router.get("/{bill_id}/backfill-items", response_model=list[schemas.BackfillItemOut])
+def bill_backfill_items(bill_id: int, db: Session = Depends(get_db),
+                        user: models.User = Depends(require_roles(
+                            models.ROLE_FINANCE, models.ROLE_OPERATOR, models.ROLE_PROPERTY))):
+    bill = _load_bill(db, bill_id, user)
+    return db.scalars(
+        select(models.BackfillAdjustmentItem)
+        .where(models.BackfillAdjustmentItem.bill_id == bill.id)
+        .order_by(models.BackfillAdjustmentItem.id)
+    ).all()
 
 
 @router.post("/{bill_id}/adjustments", response_model=schemas.AdjustmentOut)

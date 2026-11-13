@@ -7,6 +7,7 @@ import ImportsPage from "./pages/ImportsPage";
 import TasksPage from "./pages/TasksPage";
 import ConflictsPage from "./pages/ConflictsPage";
 import EntitiesPage from "./pages/EntitiesPage";
+import BackfillPage from "./pages/BackfillPage";
 
 const ROLE_LABEL: Record<string, string> = {
   finance: "平台财务",
@@ -18,6 +19,7 @@ function Shell() {
   const { role, displayName, logout } = useAuth();
   const nav = [
     { to: "/bills", label: "账单与下钻", roles: ["finance", "operator", "property"] },
+    { to: "/backfill", label: "跨月回补", roles: ["finance", "operator", "property"] },
     { to: "/jobs", label: "核算作业", roles: ["finance", "operator", "property"] },
     { to: "/imports", label: "原件与导入", roles: ["finance", "operator", "property"] },
     { to: "/tasks", label: "核对事项", roles: ["finance", "operator", "property"] },
@@ -47,6 +49,7 @@ function Shell() {
       <main className="main">
         <Routes>
           <Route path="/bills" element={<BillsPage />} />
+          <Route path="/backfill" element={<BackfillPage />} />
           <Route path="/jobs" element={<JobsPage />} />
           <Route path="/imports" element={<ImportsPage />} />
           <Route path="/tasks" element={<TasksPage />} />

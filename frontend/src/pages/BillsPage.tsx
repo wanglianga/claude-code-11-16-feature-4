@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, errText } from "../api";
 import { useAuth } from "../auth";
-import type { Bill, Interval, Split, Adjustment, Site } from "../types";
+import type { Bill, Interval, Split, Adjustment, Site, PayableView, BackfillItem } from "../types";
 
 const STATUS_LABEL: Record<string, string> = {
   draft: "待确认", suspended: "挂起", confirmed: "已确认", adjusted: "已更正",
@@ -16,6 +16,8 @@ export default function BillsPage() {
   const [intervals, setIntervals] = useState<Interval[]>([]);
   const [splits, setSplits] = useState<Split[]>([]);
   const [adjustments, setAdjustments] = useState<Adjustment[]>([]);
+  const [backfillItems, setBackfillItems] = useState<BackfillItem[]>([]);
+  const [payable, setPayable] = useState<PayableView | null>(null);
   const [precheck, setPrecheck] = useState<Record<string, unknown> | null>(null);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
@@ -32,13 +34,16 @@ export default function BillsPage() {
   const drill = async (bill: Bill) => {
     setOpenBill(bill);
     setMsg(""); setErr(""); setPrecheck(null);
-    const [iv, sp, adj, pre] = await Promise.all([
+    const [iv, sp, adj, pre, pv, bf] = await Promise.all([
       api.get<Interval[]>(`/api/jobs/${bill.job_id}/intervals`),
       api.get<Split[]>(`/api/jobs/${bill.job_id}/splits`),
       api.get<Adjustment[]>(`/api/bills/${bill.id}/adjustments`),
       api.get(`/api/bills/${bill.id}/precheck`),
+      api.get<PayableView>(`/api/bills/${bill.id}/payable`),
+      api.get<BackfillItem[]>(`/api/bills/${bill.id}/backfill-items`),
     ]);
     setIntervals(iv.data); setSplits(sp.data); setAdjustments(adj.data); setPrecheck(pre.data);
+    setPayable(pv.data); setBackfillItems(bf.data);
   };
 
   const confirm = async () => {
@@ -148,6 +153,49 @@ export default function BillsPage() {
           <div className="panel">
             <h2>差额更正记录（原值保留，不替换）</h2>
             <AdjustmentTable adjustments={adjustments} />
+          </div>
+        )}
+
+        {payable && (
+          <div className="panel">
+            <h2>当前应付（旧账金额冻结不覆盖，单列回补调整项）</h2>
+            <div className="stat-grid">
+              <div className="stat"><div className="k">原充电金额</div><div className="v">{payable.original_charging_amount}</div></div>
+              <div className="stat"><div className="k">原公共金额</div><div className="v">{payable.original_public_amount}</div></div>
+              <div className="stat"><div className="k">人工差额更正</div><div className="v">{payable.manual_adjustment_delta}</div></div>
+              <div className="stat"><div className="k">回补已确认差额</div><div className="v warn">{payable.backfill_confirmed_delta}</div></div>
+              <div className="stat"><div className="k">当前应付合计</div><div className="v">{payable.current_payable_amount}</div></div>
+              <div className="stat"><div className="k">待复核/退回</div><div className="v">{payable.backfill_pending_count} / {payable.backfill_rejected_count}</div></div>
+            </div>
+            <div className="muted" style={{ marginTop: 8 }}>{payable.note}</div>
+          </div>
+        )}
+
+        {backfillItems.length > 0 && (
+          <div className="panel">
+            <h2>跨月回补调整项（撤原贡献 + 计修正值，逐项可对平）</h2>
+            <table>
+              <thead><tr>
+                <th>变更</th><th>成分/时段</th><th className="num">电量差</th>
+                <th className="num">金额差</th><th className="num">舍入差</th>
+                <th>状态</th><th>依据说明</th>
+              </tr></thead>
+              <tbody>
+                {backfillItems.map((it) => (
+                  <tr key={it.id}>
+                    <td className="mono">{it.change_kind}<div className="muted">{it.reason_kind}</div></td>
+                    <td className="mono">{it.component}{it.segment_name ? ` / ${it.segment_name}` : ""}</td>
+                    <td className="num">{it.energy_delta}</td>
+                    <td className="num"><b>{it.amount_delta}</b></td>
+                    <td className="num">{it.rounding_delta}</td>
+                    <td><span className={`badge ${it.status === "confirmed" ? "confirmed" : "suspended"}`}>{it.status}</span></td>
+                    <td className="muted" style={{ maxWidth: 320 }}>
+                      {it.suspended_reason ?? it.reason_text}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </div>

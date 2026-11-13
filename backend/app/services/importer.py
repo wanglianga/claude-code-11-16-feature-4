@@ -19,12 +19,13 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..models import (
     ENTITY_ACTIVE,
+    ENTITY_REVOKED,
     ENTITY_SUPERSEDED,
     REV_APPLIED,
     REV_BLOCKED_ADOPTED,
@@ -35,6 +36,26 @@ from .timeutil import parse_local_datetime, utc_to_local
 
 class ImportError_(Exception):
     pass
+
+
+# 可选的修订链控制列：
+# - is_revocation=true 表示该行是对同号记录的撤销（迟到的重复/误报撤回）
+# - replaces_revision_no 显式声明本版本承接的来源版本号，用于回补按来源顺序收齐校验
+REVOCATION_FIELD = "is_revocation"
+REPLACES_FIELD = "replaces_revision_no"
+
+
+def augment_chain_fields(clean: dict) -> dict:
+    """把可选的撤销/版本链字段纳入 payload（缺省即为普通修订）。"""
+    clean = dict(clean)
+    clean["_is_revocation"] = b(clean.get(REVOCATION_FIELD, "false"))
+    replaces = (clean.get(REPLACES_FIELD) or "").strip()
+    clean["_replaces_revision_no"] = int(replaces) if replaces else None
+    return clean
+
+
+def is_revocation_payload(payload: dict) -> bool:
+    return bool(payload.get("_is_revocation"))
 
 
 def d(value) -> Decimal:
@@ -122,7 +143,14 @@ def _register_revision(
         if current.content_hash == content_hash:
             import_row.outcome = REV_DUPLICATE
             return current, REV_DUPLICATE
-        next_no = current.revision_no + 1
+        # 版本号按该来源记录已有最大版本单调递增；blocked 修订不推进 current 指针，
+        # 不能用 current.revision_no+1，否则连续 blocked 会同号，回补链校验将失效。
+        max_no = db.scalar(
+            select(func.max(models.RecordRevision.revision_no)).where(
+                models.RecordRevision.source_record_id == sr.id
+            )
+        ) or 0
+        next_no = max_no + 1
         if _is_adopted(db, sr):
             rev = models.RecordRevision(
                 source_record_id=sr.id,
@@ -164,6 +192,18 @@ def _supersede(db: Session, model, source_record_id: int) -> None:
     ).all()
     for row in rows:
         row.status = ENTITY_SUPERSEDED
+
+
+def _revoke_active(db: Session, model, source_record_id: int) -> None:
+    """撤销：同源生效实体标记 revoked（区别于普通修订的 superseded），不新增生效实体。"""
+    rows = db.scalars(
+        select(model).where(
+            model.source_record_id == source_record_id,
+            model.status == ENTITY_ACTIVE,
+        )
+    ).all()
+    for row in rows:
+        row.status = ENTITY_REVOKED
 
 
 # ---------- 按来源类型把 payload 落地为实体 ----------
@@ -344,6 +384,20 @@ def _apply_replacement(db: Session, site: models.Site, payload: dict, sr, rev):
 
 
 def apply_payload(db: Session, site: models.Site, source_type: str, payload: dict, sr, rev) -> None:
+    # 撤销类修订：不落地新生效实体，只把同源生效行标记 revoked
+    if is_revocation_payload(payload):
+        model_map = {
+            "master_reading": models.MeterReading,
+            "device_reading": models.MeterReading,
+            "order": models.ChargingOrder,
+            "public_load": models.PublicLoad,
+            "tariff": models.Tariff,
+        }
+        model = model_map.get(source_type)
+        if model is None:
+            raise ImportError_(f"来源类型 {source_type} 不支持撤销")
+        _revoke_active(db, model, sr.id)
+        return
     if source_type == "master_reading":
         _apply_reading(db, site, payload, sr, rev, "master")
     elif source_type == "device_reading":
@@ -361,7 +415,10 @@ def apply_payload(db: Session, site: models.Site, source_type: str, payload: dic
 
 
 def promote_blocked_revisions(db: Session, site: models.Site) -> int:
-    """新一轮核算开始前，把上轮被阻塞的修订提升为生效版本（沿用相同来源记录号）。"""
+    """新一轮核算开始前，把上轮被阻塞的修订提升为生效版本（沿用相同来源记录号）。
+
+    已被跨月回补批次处理（backfilled）的修订不再提升，避免与回补调整重复计入。
+    """
     blocked = db.scalars(
         select(models.RecordRevision)
         .join(models.SourceRecord, models.SourceRecord.id == models.RecordRevision.source_record_id)
@@ -462,12 +519,17 @@ def import_file(
         )
         db.add(ir)
         db.flush()
-        clean = {k: (v.strip() if isinstance(v, str) else v) for k, v in row.items() if k}
+        clean = augment_chain_fields(
+            {k: (v.strip() if isinstance(v, str) else v) for k, v in row.items() if k}
+        )
         try:
             if not record_no:
                 raise ImportError_("缺少 record_no")
             if source_type == "tariff":
-                tariff_groups.setdefault(record_no, {"segments": []})["segments"].append(clean)
+                group = augment_chain_fields(clean)
+                tariff_groups.setdefault(record_no, {"segments": [],
+                                                     "_is_revocation": group["_is_revocation"],
+                                                     "_replaces_revision_no": group["_replaces_revision_no"]})["segments"].append(clean)
                 tariff_row_ids.setdefault(record_no, []).append(ir.id)
                 continue
             # 逐行 SAVEPOINT：业务处理失败只回滚本行

@@ -12,6 +12,7 @@ const KIND_LABEL: Record<string, string> = {
   public_confirmation: "公共负荷确认",
   estimated_item: "估算项复核",
   order_meter_diff: "读数/上报偏差",
+  backfill_suspended: "回补修订链挂起",
 };
 
 export default function TasksPage() {

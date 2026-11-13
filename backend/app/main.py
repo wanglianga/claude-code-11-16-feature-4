@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .database import Base, engine
 from .routers import (
     auth,
+    backfill,
     bills,
     conflicts,
     entities,
@@ -42,5 +43,6 @@ def health():
 for r in (
     auth.router, sites.router, imports.router, jobs.router, bills.router,
     tasks.router, conflicts.router, source_records.router, entities.router,
+    backfill.router,
 ):
     app.include_router(r)

@@ -194,3 +194,76 @@ def test_operator_resolves_conflict():
     r2 = client.post(f"/api/conflicts/{c['id']}/resolve", headers=prop, json={
         "resolved_order_id": c["order_a_id"], "resolution_note": "x"})
     assert r2.status_code == 403
+
+
+def test_backfill_batch_http_flow_and_role_guard():
+    """回补全链路 HTTP：候选预览 -> 建批执行 -> 分段 -> 物业复核 -> 财务确认 -> 应付视图。"""
+    from pathlib import Path
+    from app.services.importer import import_file
+
+    db = SessionLocal()
+    try:
+        site = db.scalar(select(models.Site).where(models.Site.code == "S01"))
+        job = run_reconciliation(db, site, datetime(2026, 10, 1), datetime(2026, 11, 1), "tester")
+        db.commit()
+        bill = db.scalar(select(models.Bill).where(models.Bill.job_id == job.id))
+        # 回补只面向已确认月份，先确认 10 月账单
+        from app.services.billing import confirm_bill
+        confirm_bill(db, bill, db.scalar(select(models.User).where(
+            models.User.username == "finance")))
+        db.commit()
+        bill_id = bill.id
+        content = (Path(__file__).resolve().parent.parent
+                   / "sample_data" / "S01" / "backfill" / "02_late_order.csv").read_bytes()
+        import_file(db, site, "order", "late.csv", content, "tester", "data/test_originals")
+        db.commit()
+    finally:
+        db.close()
+
+    fin = _auth(_login("finance", "Finance@123"))
+    prop = _auth(_login("property_sh", "Property@123"))
+
+    # 物业不能创建批次
+    assert client.post("/api/backfill/batches", headers=prop,
+                       json={"site_id": 1}).status_code == 403
+    # 候选预览
+    cands = client.get("/api/backfill/candidates?site_id=1", headers=fin).json()
+    assert any(c["change_kind"] == "late" for c in cands)
+    # 创建并执行
+    r = client.post("/api/backfill/batches", headers=fin,
+                    json={"site_id": 1, "reason_note": "http 回补"})
+    assert r.status_code == 200
+    batch_id = r.json()["id"]
+    r = client.post(f"/api/backfill/batches/{batch_id}/run", headers=fin)
+    assert r.status_code == 200 and r.json()["status"] == "completed"
+    # 分段进度
+    segs = client.get(f"/api/backfill/batches/{batch_id}/segments", headers=fin).json()
+    assert segs and all(s["status"] == "done" for s in segs)
+    # 调整项
+    items = client.get(f"/api/backfill/batches/{batch_id}/items", headers=fin).json()
+    assert items and any(i["amount_delta"] == "15.0000" for i in items)
+    item_id = items[0]["id"]
+    # 财务不能跳过物业直接确认
+    assert client.post(f"/api/backfill/items/{item_id}/reviews", headers=fin,
+                       json={"action": "confirm"}).status_code == 409
+    # 物业复核 -> 财务确认
+    assert client.post(f"/api/backfill/items/{item_id}/reviews", headers=prop,
+                       json={"action": "acknowledge", "comment": "核对无误"}).status_code == 200
+    r = client.post(f"/api/backfill/items/{item_id}/reviews", headers=fin,
+                    json={"action": "confirm"})
+    assert r.status_code == 200 and r.json()["status"] == "confirmed"
+    # 双方复核分别留痕
+    reviews = client.get(f"/api/backfill/items/{item_id}/reviews", headers=fin).json()
+    assert {rv["review_party"] for rv in reviews} == {"property", "finance"}
+    # 应付视图同时引用旧账与回补项
+    pv = client.get(f"/api/bills/{bill_id}/payable", headers=fin).json()
+    assert pv["backfill_confirmed_count"] >= 1
+    assert pv["backfill_confirmed_delta"] == "15.0000"
+    assert float(pv["current_payable_amount"]) == (
+        float(pv["original_charging_amount"])
+        + float(pv["original_public_amount"])
+        + float(pv["manual_adjustment_delta"])
+        + float(pv["backfill_confirmed_delta"]))
+    # 账单下钻能看到回补项
+    bf_items = client.get(f"/api/bills/{bill_id}/backfill-items", headers=fin).json()
+    assert len(bf_items) >= 1

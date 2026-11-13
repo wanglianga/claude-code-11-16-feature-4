@@ -73,9 +73,10 @@ label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px
 .badge.completed, .badge.confirmed, .badge.resolved, .badge.measured, .badge.submitted { background: #dcfce7; color: var(--ok); }
 .badge.suspended, .badge.pending, .badge.open { background: #ffedd5; color: var(--suspended); }
 .badge.estimated { background: #fef9c3; color: var(--warn); }
-.badge.adjusted, .badge.applied, .badge.duplicate { background: var(--primary-soft); color: var(--primary); }
+.badge.adjusted, .badge.applied, .badge.duplicate, .badge.property_reviewed, .badge.running { background: var(--primary-soft); color: var(--primary); }
 .badge.blocked_adopted { background: #fee2e2; color: var(--danger); }
-.badge.rejected { background: #fee2e2; color: var(--danger); }
+.badge.rejected, .badge.failed { background: #fee2e2; color: var(--danger); }
+.badge.done, .badge.pending_confirmation, .badge.skipped { background: #f1f5f9; color: #475569; }
 
 .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .stat { background: #f8fafd; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }

@@ -151,7 +151,39 @@ def gen_urumqi():
     ])
 
 
+def gen_backfill():
+    """跨月回补演示数据（在 10 月账单确认之后导入，见 README 第十节）。
+
+    01 纠正的总表读数、02 迟到订单、03 撤销的重复订单、04 电价更正；
+    05 必须在 orders_v3_after_adopt.csv（产生 rev2）之后导入，
+    其声明 replaces_revision_no=1 而实际前序应为 rev2，用于演示缺链/断链挂起。
+    """
+    d = BASE / "S01" / "backfill"
+    write(d / "01_corrected_master_reading.csv", READING_HEADER, [
+        "MR-SH-003,M-SH-01,,2026-10-15 00:00,6290,true",
+    ])
+    write(d / "02_late_order.csv", ORDER_HEADER, [
+        "OR-SH-LATE1,O-1999,DEV-A,2026-10-12 13:00,2026-10-12 14:00,200,220,20",
+    ])
+    write(d / "03_revoke_duplicate_order.csv",
+          ORDER_HEADER + ",is_revocation", [
+        "OR-SH-002,O-1002,DEV-A,2026-10-03 21:00,2026-10-03 23:00,40,60,20,true",
+    ])
+    write(d / "04_tariff_correction.csv", TARIFF_HEADER, [
+        "TAR-SH-Q3,上海三季度电价,2026-09-01,2026-10-15,valley,0,6,0.3600",
+        "TAR-SH-Q3,上海三季度电价,2026-09-01,2026-10-15,peak,6,10,1.0600",
+        "TAR-SH-Q3,上海三季度电价,2026-09-01,2026-10-15,flat,10,18,0.7600",
+        "TAR-SH-Q3,上海三季度电价,2026-09-01,2026-10-15,peak,18,22,1.0600",
+        "TAR-SH-Q3,上海三季度电价,2026-09-01,2026-10-15,valley,22,24,0.3600",
+    ])
+    write(d / "05_broken_chain_order.csv",
+          ORDER_HEADER + ",replaces_revision_no", [
+        "OR-SH-003,O-1003,DEV-A,2026-10-05 02:00,2026-10-05 04:00,60,87,27,1",
+    ])
+
+
 if __name__ == "__main__":
     gen_shanghai()
     gen_urumqi()
+    gen_backfill()
     print(f"样例文件已生成于 {BASE}")

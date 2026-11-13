@@ -1,0 +1,2 @@
+record_no,order_no,device_id,start_time,end_time,start_reading,end_reading,reported_energy
+OR-SH-LATE1,O-1999,DEV-A,2026-10-12 13:00,2026-10-12 14:00,200,220,20

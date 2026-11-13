@@ -15,6 +15,9 @@ def check_new_revisions(db: Session, job: models.ReconciliationJob) -> list[mode
     包括两类：
     1. 来源记录当前生效版本已不同于快照版本（下一轮提升后的修订）；
     2. 作业采用后到达、被标记 blocked_adopted 的更正（留待下一轮，同样阻止本轮确认）。
+
+    已由跨月回补批次处理（backfilled）的修订不在此列：它们的差额已通过回补调整项
+    单列结算，不能再作为“未处理修订”永久阻塞后续账单确认。
     """
     snapshot = db.scalars(
         select(models.JobInput).where(models.JobInput.job_id == job.id)
@@ -28,11 +31,14 @@ def check_new_revisions(db: Session, job: models.ReconciliationJob) -> list[mode
             continue
         sr = db.get(models.SourceRecord, base_rev.source_record_id)
         if sr.current_revision_id and sr.current_revision_id != snap.revision_id:
-            new_rev_ids.add(sr.current_revision_id)
+            cur = db.get(models.RecordRevision, sr.current_revision_id)
+            if cur is not None and cur.status != models.REV_BACKFILLED:
+                new_rev_ids.add(sr.current_revision_id)
         later = db.scalars(
             select(models.RecordRevision).where(
                 models.RecordRevision.source_record_id == sr.id,
                 models.RecordRevision.id > snap.revision_id,
+                models.RecordRevision.status != models.REV_BACKFILLED,
             )
         ).all()
         for rev in later:
@@ -58,6 +64,11 @@ def confirm_bill(db: Session, bill: models.Bill, user: models.User) -> models.Bi
     bill.status = models.BILL_CONFIRMED
     bill.confirmed_at = datetime.utcnow()
     bill.confirmed_by = user.username
+    db.flush()
+    # 新账单确认即把同站点已确认未关联的回补调整项自动单列带入后续结算；
+    # 放在服务层保证任何确认入口（API/脚本/测试）行为一致。
+    from .backfill import auto_link_on_settlement
+    auto_link_on_settlement(db, bill)
     db.flush()
     return bill
 

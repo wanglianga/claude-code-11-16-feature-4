@@ -1,0 +1,2 @@
+record_no,order_no,device_id,start_time,end_time,start_reading,end_reading,reported_energy,is_revocation
+OR-SH-002,O-1002,DEV-A,2026-10-03 21:00,2026-10-03 23:00,40,60,20,true

@@ -26,11 +26,13 @@ ROLE_PROPERTY = "property"        # 物业：仅分配给自己站点的核对�
 REV_DUPLICATE = "duplicate"            # 同号同内容
 REV_APPLIED = "applied"                # 同号内容变化，已生效（原数据未被账单采用）
 REV_BLOCKED_ADOPTED = "blocked_adopted"  # 同号内容变化但原数据已被采用，留待下一轮
+REV_BACKFILLED = "backfilled"          # 已由跨月回补批次处理，不再提升为当期生效实体
 
 ENTITY_ACTIVE = "active"
 ENTITY_SUPERSEDED = "superseded"
 ENTITY_PENDING = "pending_data"    # 缺起止读数等
 ENTITY_SUSPENDED = "suspended"     # 回退无依据等原因挂起
+ENTITY_REVOKED = "revoked"         # 迟到的撤销：重复记录/误报被撤回，原贡献需在回补中撤出
 
 JOB_RUNNING = "running"
 JOB_COMPLETED = "completed"
@@ -53,6 +55,47 @@ TASK_RESOLVED = "resolved"
 
 CONFLICT_OPEN = "open"
 CONFLICT_RESOLVED = "resolved"
+
+# ---- 跨月回补（backfill）状态 ----
+BF_BATCH_PENDING = "pending"        # 已建批次，尚未执行
+BF_BATCH_RUNNING = "running"        # 分段执行中，进度按区间落库，失败可续算
+BF_BATCH_SUSPENDED = "suspended"    # 存在挂起分段（缺中间修订版本等），补齐后续算
+BF_BATCH_COMPLETED = "completed"    # 全部分段处理完成
+BF_BATCH_FAILED = "failed"          # 执行异常，已完成分段不重算
+
+BF_SEG_PENDING = "pending"
+BF_SEG_RUNNING = "running"
+BF_SEG_DONE = "done"
+BF_SEG_SUSPENDED = "suspended"      # 同源修订未收齐（缺中间版本），挂起等待
+BF_SEG_FAILED = "failed"
+BF_SEG_SKIPPED = "skipped"          # 该区间无任何更正贡献，无需重算
+
+BF_ADJ_PENDING = "pending_confirmation"   # 待双方复核确认
+BF_ADJ_PROPERTY = "property_reviewed"     # 物业已复核
+BF_ADJ_CONFIRMED = "confirmed"            # 财务确认，差额进入后续结算
+BF_ADJ_REJECTED = "rejected"              # 物业否认该段依据，仅本调整退回
+BF_ADJ_SUSPENDED = "suspended"            # 修订链缺版本挂起，未产生可结算金额
+
+BF_REVIEW_PROPERTY = "property"
+BF_REVIEW_FINANCE = "finance"
+
+# 回补调整项涉及的成分（与账单字段对齐，另加 master 总表与 rounding 舍入说明）
+BF_COMP_MASTER = "master_total_kwh"
+BF_COMP_CHARGING_KWH = "charging_kwh"
+BF_COMP_ESTIMATED_KWH = "estimated_kwh"
+BF_COMP_PUBLIC_KWH = "public_kwh"
+BF_COMP_UNEXPLAINED_KWH = "unexplained_kwh"
+BF_COMP_CHARGING_AMOUNT = "charging_amount"
+BF_COMP_PUBLIC_AMOUNT = "public_amount"
+BF_COMP_ROUNDING = "rounding"          # 纯舍入变化（电量不变、仅金额尾差）
+BF_COMP_TARIFF = "tariff_price"        # 电价修正引起的金额变化
+
+# 更正原因类别
+BF_REASON_LATE_ORDER = "late_order"            # 迟到订单
+BF_REASON_CORRECTED_READING = "corrected_reading"  # 被纠正的表读数
+BF_REASON_DUPLICATE_REVOKED = "duplicate_revoked"  # 撤销的重复记录
+BF_REASON_TARIFF_CORRECTION = "tariff_correction"  # 电价更正
+BF_REASON_PUBLIC_CORRECTION = "public_correction"  # 公共负荷更正
 
 
 class Site(Base):
@@ -147,11 +190,13 @@ class RecordRevision(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     source_record_id: Mapped[int] = mapped_column(ForeignKey("source_records.id"), index=True)
     revision_no: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(32))  # applied / duplicate / blocked_adopted
+    status: Mapped[str] = mapped_column(String(32))  # applied / duplicate / blocked_adopted / backfilled
     content_hash: Mapped[str] = mapped_column(String(64))
     payload_json: Mapped[str] = mapped_column(Text)
     import_row_id: Mapped[int] = mapped_column(ForeignKey("import_rows.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("source_record_id", "revision_no",
+                                       name="uq_revision_source_no"),)
 
 
 class DeviceReplacement(Base):
@@ -401,4 +446,175 @@ class ReviewTask(Base):
     response: Mapped[str | None] = mapped_column(Text, nullable=True)
     responded_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     responded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ===================== 跨月回补（backfill）=====================
+
+class BackfillBatch(Base):
+    """回补批次：发起时冻结固定更正数据集合，新到更正只能进入下一批。"""
+    __tablename__ = "backfill_batches"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    batch_no: Mapped[str] = mapped_column(String(64), unique=True)
+    status: Mapped[str] = mapped_column(String(16), default=BF_BATCH_PENDING, index=True)
+    reason_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    segment_total: Mapped[int] = mapped_column(Integer, default=0)
+    segment_done: Mapped[int] = mapped_column(Integer, default=0)
+    segment_suspended: Mapped[int] = mapped_column(Integer, default=0)
+    segment_failed: Mapped[int] = mapped_column(Integer, default=0)
+    segments: Mapped[list["BackfillSegment"]] = relationship(back_populates="batch")
+    inputs: Mapped[list["BackfillBatchInput"]] = relationship(back_populates="batch")
+    items: Mapped[list["BackfillAdjustmentItem"]] = relationship(back_populates="batch")
+
+
+class BackfillBatchInput(Base):
+    """批次冻结的更正数据集合：批次启动后到达的修订不在其中，只能进下一批。"""
+    __tablename__ = "backfill_batch_inputs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("backfill_batches.id"), index=True)
+    source_record_id: Mapped[int] = mapped_column(ForeignKey("source_records.id"))
+    revision_id: Mapped[int] = mapped_column(ForeignKey("record_revisions.id"))
+    source_type: Mapped[str] = mapped_column(String(32))
+    source_record_no: Mapped[str] = mapped_column(String(96))
+    change_kind: Mapped[str] = mapped_column(String(32))  # late/correction/revocation
+    batch: Mapped[BackfillBatch] = relationship(back_populates="inputs")
+    __table_args__ = (UniqueConstraint("batch_id", "source_record_id"),)
+
+
+class BackfillSegment(Base):
+    """按受影响计量区间分段保存进度；失败只重算未完成分段。"""
+    __tablename__ = "backfill_segments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("backfill_batches.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    bill_id: Mapped[int] = mapped_column(ForeignKey("bills.id"), index=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_jobs.id"))
+    reconciliation_interval_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_intervals.id"))
+    start_ts: Mapped[datetime] = mapped_column(DateTime)
+    end_ts: Mapped[datetime] = mapped_column(DateTime)
+    start_ts_local: Mapped[datetime] = mapped_column(DateTime)
+    end_ts_local: Mapped[datetime] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(16), default=BF_SEG_PENDING, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suspended_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    batch: Mapped[BackfillBatch] = relationship(back_populates="segments")
+    items: Mapped[list["BackfillAdjustmentItem"]] = relationship(back_populates="segment")
+    __table_args__ = (UniqueConstraint("batch_id", "reconciliation_interval_id"),)
+
+
+class BackfillContribution(Base):
+    """原贡献台账：每条被旧作业采用的贡献只允许被撤回一次，后批次可见前批次生效记录。"""
+    __tablename__ = "backfill_contributions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    source_record_id: Mapped[int] = mapped_column(ForeignKey("source_records.id"), index=True)
+    revision_id: Mapped[int] = mapped_column(ForeignKey("record_revisions.id"))
+    entity_kind: Mapped[str] = mapped_column(String(32))  # order/reading_master/reading_device/public_load/tariff
+    entity_id: Mapped[int] = mapped_column(Integer)
+    job_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_jobs.id"), index=True)
+    bill_id: Mapped[int] = mapped_column(ForeignKey("bills.id"), index=True)
+    reconciliation_interval_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reconciliation_intervals.id"), nullable=True)
+    order_split_id: Mapped[int | None] = mapped_column(ForeignKey("order_interval_splits.id"), nullable=True)
+    segment_name: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    price_per_kwh: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    energy_kwh: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    # active=仍在生效；withdrawn=已被某回补批次撤回；revised=被修正值替代后旧行留存
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    supersedes_contribution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("backfill_contributions.id"), nullable=True)
+    withdrawn_by_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("backfill_batches.id"), nullable=True)
+    withdrawn_by_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("backfill_adjustment_items.id", use_alter=True,
+                   name="fk_contribution_withdrawn_item"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        # 同一 split 在不同批次可留下多条历史行（撤回/替代），故只建索引不建唯一约束
+        Index("ix_contribution_split_src", "order_split_id", "source_record_id"),
+        Index("ix_contribution_interval_src",
+              "reconciliation_interval_id", "source_record_id", "entity_kind"),
+    )
+
+
+class BackfillAdjustmentItem(Base):
+    """回补调整项：撤原贡献+计修正值形成的待确认差额，逐项可追溯到原始事件与原计算。"""
+    __tablename__ = "backfill_adjustment_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("backfill_batches.id"), index=True)
+    segment_id: Mapped[int] = mapped_column(ForeignKey("backfill_segments.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    bill_id: Mapped[int] = mapped_column(ForeignKey("bills.id"), index=True)
+    source_job_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_jobs.id"))
+    source_record_id: Mapped[int] = mapped_column(ForeignKey("source_records.id"))
+    from_revision_id: Mapped[int | None] = mapped_column(ForeignKey("record_revisions.id"), nullable=True)
+    to_revision_id: Mapped[int | None] = mapped_column(ForeignKey("record_revisions.id"), nullable=True)
+    change_kind: Mapped[str] = mapped_column(String(32))   # late/correction/revocation
+    reason_kind: Mapped[str] = mapped_column(String(32))
+    component: Mapped[str] = mapped_column(String(32))
+    segment_name: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    price_before: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    price_after: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    energy_before: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    energy_after: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    energy_delta: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    amount_before: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    amount_after: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    amount_delta: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    rounding_delta: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    basis_before: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    basis_after: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 完整对平依据：原始事件 payload、原计算取值、修正计算过程、舍入说明
+    detail_json: Mapped[str] = mapped_column(Text)
+    reason_text: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), default=BF_ADJ_PENDING, index=True)
+    suspended_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    property_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    confirmed_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rejected_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reject_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    batch: Mapped[BackfillBatch] = relationship(back_populates="items")
+    segment: Mapped[BackfillSegment] = relationship(back_populates="items")
+    reviews: Mapped[list["BackfillReview"]] = relationship(back_populates="item")
+
+
+class BackfillReview(Base):
+    """双方复核分别保存：物业复核与财务确认各自留痕，互不覆盖。"""
+    __tablename__ = "backfill_reviews"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("backfill_adjustment_items.id"), index=True)
+    review_party: Mapped[str] = mapped_column(String(16))  # property / finance
+    action: Mapped[str] = mapped_column(String(24))        # acknowledge / reject / confirm
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewer: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    item: Mapped[BackfillAdjustmentItem] = relationship(back_populates="reviews")
+    __table_args__ = (UniqueConstraint("item_id", "review_party"),)
+
+
+class BackfillBillLink(Base):
+    """调整项与后续账单的关联单独保存；旧账金额不被覆盖，应付同时引用旧账与调整项。"""
+    __tablename__ = "backfill_bill_links"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("backfill_batches.id"), index=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("backfill_adjustment_items.id"))
+    original_bill_id: Mapped[int] = mapped_column(ForeignKey("bills.id"), index=True)
+    settlement_bill_id: Mapped[int | None] = mapped_column(ForeignKey("bills.id"), nullable=True)
+    linked_amount: Mapped[Decimal] = mapped_column(Numeric(14, 4))
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/linked
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

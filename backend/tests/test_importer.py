@@ -1,11 +1,16 @@
-"""导入规则：原件留存、来源记录号去重、修订、已采用不覆盖。"""
+"""导入规则：原件留存、来源记录号去重、修订、已采用不覆盖、撤销、版本号单调。"""
+import csv
+from datetime import datetime
+from pathlib import Path
+
 from sqlalchemy import select
 
 from app.database import SessionLocal
 from app import models
 from app.services.importer import import_file
+from app.services.reconciliation import run_reconciliation
 
-SAMPLE = __import__("pathlib").Path(__file__).resolve().parent.parent / "sample_data"
+SAMPLE = Path(__file__).resolve().parent.parent / "sample_data"
 
 
 def _read(code, name):
@@ -115,5 +120,69 @@ def test_revision_after_adoption_is_blocked_not_overwritten():
             models.RecordRevision.source_record_id == sr.id,
             models.RecordRevision.status == models.REV_BLOCKED_ADOPTED)).all()
         assert len(blocked) == 1
+    finally:
+        db.close()
+
+
+def test_revocation_marks_entity_revoked_without_new_active_row(tmp_path):
+    """撤销类修订：不新增生效实体，同源 active 行置 revoked。"""
+    db = SessionLocal()
+    try:
+        site = db.scalar(select(models.Site).where(models.Site.code == "S01"))
+        p = tmp_path / "revoke.csv"
+        with p.open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["record_no", "order_no", "device_id", "start_time", "end_time",
+                        "start_reading", "end_reading", "reported_energy", "is_revocation"])
+            w.writerow(["OR-SH-001", "O-1001", "DEV-A", "2026-10-02 09:00",
+                        "2026-10-02 11:00", "10", "40", "30", "true"])
+        result = import_file(db, site, "order", "revoke.csv", p.read_bytes(),
+                             "tester", "data/test_originals")
+        db.commit()
+        assert result["summary"].get("applied", 0) == 1
+        orders = db.scalars(select(models.ChargingOrder).where(
+            models.ChargingOrder.site_id == site.id,
+            models.ChargingOrder.order_no == "O-1001")).all()
+        assert any(o.status == models.ENTITY_REVOKED for o in orders)
+        assert not any(o.status == models.ENTITY_ACTIVE for o in orders)
+    finally:
+        db.close()
+
+
+def test_consecutive_blocked_revisions_keep_monotonic_revision_no():
+    """连续多次作业后更正：修订号必须单调递增，不能复用 current+1 造成同号。"""
+    db = SessionLocal()
+    try:
+        site = db.scalar(select(models.Site).where(models.Site.code == "S01"))
+        run_reconciliation(db, site, datetime(2026, 10, 1), datetime(2026, 11, 1), "tester")
+        db.commit()
+        sr = db.scalar(select(models.SourceRecord).where(
+            models.SourceRecord.site_id == site.id,
+            models.SourceRecord.source_record_no == "OR-SH-003"))
+        base_nos = [r.revision_no for r in db.scalars(
+            select(models.RecordRevision).where(
+                models.RecordRevision.source_record_id == sr.id)).all()]
+
+        def push(end_reading):
+            import io
+            content = (
+                "record_no,order_no,device_id,start_time,end_time,"
+                "start_reading,end_reading,reported_energy\n"
+                f"OR-SH-003,O-1003,DEV-A,2026-10-05 02:00,2026-10-05 04:00,"
+                f"60,{end_reading},26\n"
+            )
+            return import_file(db, site, "order", f"v_{end_reading}.csv",
+                               content.encode(), "tester", "data/test_originals")
+
+        push(86)
+        push(87)
+        db.commit()
+        revs = db.scalars(select(models.RecordRevision).where(
+            models.RecordRevision.source_record_id == sr.id
+        ).order_by(models.RecordRevision.revision_no)).all()
+        nos = [r.revision_no for r in revs]
+        assert nos == sorted(set(nos))  # 无重复且单调
+        assert nos[:len(base_nos)] == base_nos
+        assert all(r.status == models.REV_BLOCKED_ADOPTED for r in revs[len(base_nos):])
     finally:
         db.close()

@@ -1,0 +1,6 @@
+record_no,tariff_name,effective_date,end_date,segment_name,start_hour,end_hour,price
+TAR-SH-Q3,上海三季度电价,2026-09-01,2026-10-15,valley,0,6,0.3600
+TAR-SH-Q3,上海三季度电价,2026-09-01,2026-10-15,peak,6,10,1.0600
+TAR-SH-Q3,上海三季度电价,2026-09-01,2026-10-15,flat,10,18,0.7600
+TAR-SH-Q3,上海三季度电价,2026-09-01,2026-10-15,peak,18,22,1.0600
+TAR-SH-Q3,上海三季度电价,2026-09-01,2026-10-15,valley,22,24,0.3600

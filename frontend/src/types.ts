@@ -121,3 +121,99 @@ export interface Adjustment {
   created_by: string;
   created_at: string;
 }
+
+export interface BackfillBatch {
+  id: number;
+  site_id: number;
+  batch_no: string;
+  status: string;
+  reason_note: string | null;
+  created_by: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  message: string | null;
+  segment_total: number;
+  segment_done: number;
+  segment_suspended: number;
+  segment_failed: number;
+}
+
+export interface BackfillSegment {
+  id: number;
+  batch_id: number;
+  bill_id: number;
+  job_id: number;
+  reconciliation_interval_id: number;
+  start_ts_local: string;
+  end_ts_local: string;
+  status: string;
+  attempts: number;
+  last_error: string | null;
+  suspended_reason: string | null;
+  processed_at: string | null;
+}
+
+export interface BackfillItem {
+  id: number;
+  batch_id: number;
+  segment_id: number;
+  site_id: number;
+  bill_id: number;
+  source_job_id: number;
+  source_record_id: number;
+  from_revision_id: number | null;
+  to_revision_id: number | null;
+  change_kind: string;
+  reason_kind: string;
+  component: string;
+  segment_name: string | null;
+  price_before: string | null;
+  price_after: string | null;
+  energy_before: string;
+  energy_after: string;
+  energy_delta: string;
+  amount_before: string;
+  amount_after: string;
+  amount_delta: string;
+  rounding_delta: string;
+  basis_before: string | null;
+  basis_after: string | null;
+  detail_json: string;
+  reason_text: string;
+  status: string;
+  suspended_reason: string | null;
+  created_by: string;
+  created_at: string;
+  property_reviewed_at: string | null;
+  confirmed_at: string | null;
+  confirmed_by: string | null;
+  rejected_at: string | null;
+  rejected_by: string | null;
+  reject_note: string | null;
+}
+
+export interface BackfillReview {
+  id: number;
+  item_id: number;
+  review_party: string;
+  action: string;
+  comment: string | null;
+  reviewer: string;
+  created_at: string;
+}
+
+export interface PayableView {
+  bill_id: number;
+  bill_no: string;
+  original_charging_amount: string;
+  original_public_amount: string;
+  manual_adjustment_delta: string;
+  backfill_confirmed_delta: string;
+  current_payable_amount: string;
+  backfill_item_total: number;
+  backfill_confirmed_count: number;
+  backfill_pending_count: number;
+  backfill_rejected_count: number;
+  note: string;
+}
